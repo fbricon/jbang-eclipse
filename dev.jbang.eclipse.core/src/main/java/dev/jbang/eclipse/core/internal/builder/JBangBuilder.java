@@ -1,6 +1,7 @@
 package dev.jbang.eclipse.core.internal.builder;
 
 import static dev.jbang.eclipse.core.internal.JBangFileUtils.isJBangFile;
+import static dev.jbang.eclipse.core.JBangCorePlugin.*;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -23,6 +24,7 @@ import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.JavaCore;
 import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.dom.ASTNode;
+import org.eclipse.jdt.core.dom.ASTParser;
 import org.eclipse.jdt.core.dom.ASTVisitor;
 import org.eclipse.jdt.core.dom.Comment;
 import org.eclipse.jdt.core.dom.CompilationUnit;
@@ -30,23 +32,26 @@ import org.eclipse.jdt.core.dom.LineComment;
 import org.eclipse.jdt.core.dom.MarkerAnnotation;
 import org.eclipse.jdt.core.dom.SingleMemberAnnotation;
 import org.eclipse.jdt.core.manipulation.CoreASTProvider;
+import org.eclipse.jdt.internal.corext.dom.IASTSharedValues;
 
 import dev.jbang.eclipse.core.JBangCorePlugin;
 import dev.jbang.eclipse.core.internal.JBangConstants;
 import dev.jbang.eclipse.core.internal.process.JBangDependencyError;
 import dev.jbang.eclipse.core.internal.process.JBangError;
 import dev.jbang.eclipse.core.internal.process.JBangExecution;
-import dev.jbang.eclipse.core.internal.process.JBangInfo;
+import dev.jbang.eclipse.core.internal.process.JBangInfoResult;
 import dev.jbang.eclipse.core.internal.project.JBangProject;
 import dev.jbang.eclipse.core.internal.project.ProjectConfigurationManager;
 
 public class JBangBuilder extends IncrementalProjectBuilder {
 
 	private static final Integer MISSING_HASH = -1;
+	//TODO evict cache of closed/deleted projects
 	private Map<IFile, Integer> configCache = new ConcurrentHashMap<>();
 
 	@Override
 	protected IProject[] build(int kind, Map<String, String> args, IProgressMonitor monitor) throws CoreException {
+		long start = System.currentTimeMillis();
 		IResourceDelta delta = getDelta(getProject());
 		if (delta != null) {
 			JBangResourceDeltaVisitor visitor = new JBangResourceDeltaVisitor();
@@ -56,13 +61,18 @@ public class JBangBuilder extends IncrementalProjectBuilder {
 			SubMonitor subMonitor = SubMonitor.convert(monitor, filesModified + filesDeleted);
 
 			if (!visitor.jbangFiles.isEmpty()) {
+				long startConfig = System.currentTimeMillis();
 				configure(visitor.jbangFiles, subMonitor.split(filesModified));
+				long configured = System.currentTimeMillis() - startConfig;
+				logInfo("JBang Builder configured "+filesModified+" files in "+configured+" ms");
 			}
 			if (!visitor.deletedJbangFiles.isEmpty()) {
 				unconfigure(visitor.deletedJbangFiles, subMonitor.split(filesDeleted));
 			}
 			subMonitor.done();
 		}
+		long elapsed = System.currentTimeMillis() - start;
+		logInfo("JBang Builder ran in "+elapsed+" ms");
 		return new IProject[0];
 	}
 
@@ -81,9 +91,9 @@ public class JBangBuilder extends IncrementalProjectBuilder {
 			}
 			monitor.setTaskName("Updating JBang configuration from " + file.getName());
 			configCache.put(file, newConfigHash);
-			System.err.println(file + " configuration changed, checking jbang info");
-			JBangExecution execution = new JBangExecution(jbang, file.getLocation().toFile());
-			JBangInfo info = execution.getInfo();
+			//System.err.println(file + " configuration changed, checking jbang info");
+			var execution = new JBangExecution(jbang, file.getLocation().toFile(), null);
+			JBangInfoResult info = execution.getInfo(monitor);
 			clearMarkers(file);
 			if (info != null) {
 				if (info.getResolutionErrors() == null || info.getResolutionErrors().isEmpty()) {
@@ -94,7 +104,7 @@ public class JBangBuilder extends IncrementalProjectBuilder {
 						try {
 							addErrorMarker(file, source, e);
 						} catch (CoreException e1) {
-							e1.printStackTrace();
+							log(e1);
 						}
 					});
 				}
@@ -209,7 +219,10 @@ public class JBangBuilder extends IncrementalProjectBuilder {
 
 	@SuppressWarnings("unchecked")
 	static Integer getConfigHash(IFile file, IProgressMonitor monitor) throws JavaModelException {
+		
 		ICompilationUnit typeRoot = JavaCore.createCompilationUnitFrom(file);
+		//FIXME This is uber slow. Once a file is saved, its AST is disposed, we're not benefiting from reusing a cached AST, 
+		// hence pay the price of recomputing it from scratch
 		CompilationUnit root = CoreASTProvider.getInstance().getAST(typeRoot, CoreASTProvider.WAIT_YES, monitor);
 		if (root == null) {
 			return 0;
@@ -226,7 +239,8 @@ public class JBangBuilder extends IncrementalProjectBuilder {
 
 		private static final Pattern GROOVY_GRAPES = Pattern.compile("^(@Grab|@Grapes).*$");
 
-		private static final Pattern JBANG_INSTRUCTIONS = Pattern.compile("^(//[A-Z]+ ).*$");
+		private static final Pattern JBANG_INSTRUCTIONS = Pattern.compile("^(//[A-Z_]+ ).*$");
+
 
 		private List<String> configElements = new ArrayList<>();
 
@@ -276,4 +290,5 @@ public class JBangBuilder extends IncrementalProjectBuilder {
 		}
 
 	}
+	
 }
